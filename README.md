@@ -78,3 +78,17 @@ pip install -r requirements.txt
 ```
 
 ## Project structure
+llm-pipeline-forecaster/
+├── llm_pipeline_forecaster_demo.ipynb   # full demo notebook
+├── requirements.txt
+└── README.md
+
+## Related
+
+- [sktime](https://github.com/sktime/sktime)
+- [sktime issue #9721](https://github.com/sktime/sktime/issues/9721)
+- [sktime-mcp](https://github.com/sktime/sktime-mcp)
+
+## License
+
+MIT
