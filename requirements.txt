@@ -1,0 +1,8 @@
+sktime==0.40.1
+groq
+pandas
+numpy
+matplotlib
+statsmodels
+pmdarima
+scikit-learn
