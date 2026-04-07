@@ -6,6 +6,10 @@ from a natural language prompt.
 
 Built as part of the sktime agentic track for ESoC 2026.
 
+This repo now also includes an MCP integration layer so the forecaster can be
+driven tool-by-tool from Claude Desktop, Cursor, or any other MCP-compatible
+agent.
+
 ## What it does
 
 Given a natural language prompt and time series data, the forecaster:
@@ -77,9 +81,63 @@ The LLM composes from these components:
 pip install -r requirements.txt
 ```
 
+## MCP integration
+
+The MCP bonus criterion in [sktime issue #9721](https://github.com/sktime/sktime/issues/9721)
+asks for a forecaster that either uses `sktime-mcp` tools or exposes a
+reasonably defined custom set of MCP tools. This repo now does that with
+[`sktime_mcp_tools.py`](./sktime_mcp_tools.py).
+
+It exposes four agent-callable tools:
+
+1. `analyze_timeseries`
+2. `compose_pipeline`
+3. `fit_and_forecast`
+4. `assess_confidence`
+
+These map directly onto the LLMPipelineForecaster workflow, but make each
+stage inspectable and remotely callable over MCP.
+
+## Run the MCP server
+
+```bash
+python sktime_mcp_tools.py
+```
+
+## Claude Desktop config
+
+Add this to your Claude Desktop MCP config:
+
+```json
+{
+  "mcpServers": {
+    "sktime-forecasting": {
+      "command": "python",
+      "args": [
+        "/absolute/path/to/llm-pipeline-forecaster/sktime_mcp_tools.py"
+      ],
+      "env": {
+        "GROQ_API_KEY": "your_groq_key"
+      }
+    }
+  }
+}
+```
+
+## Notebook example
+
+`demo_cleaned.ipynb` now includes an Example 5 section showing the same
+forecasting workflow driven through MCP tool calls. A copy of that cell is also
+available in
+[`sktime_mcp_integration_notebook_cell.py`](./sktime_mcp_integration_notebook_cell.py)
+for easy reuse.
+
 ## Project structure
 llm-pipeline-forecaster/
-├── llm_pipeline_forecaster_demo.ipynb   # full demo notebook
+├── demo_cleaned.ipynb
+├── llm_pipeline_forecaster.py
+├── sktime_mcp_tools.py
+├── sktime_mcp_integration_notebook_cell.py
 ├── requirements.txt
 └── README.md
 
