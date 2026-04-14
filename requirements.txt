@@ -2,8 +2,11 @@ sktime==0.40.1
 mcp
 groq
 pandas
-numpy
+numpy<2
 matplotlib
 statsmodels
 pmdarima
 scikit-learn
+
+pytest
+pytest-mock
