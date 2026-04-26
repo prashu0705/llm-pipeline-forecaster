@@ -20,7 +20,8 @@ Given a natural language prompt and time series data, the forecaster:
 3. **Evaluates** the pipeline on a validation split
 4. **Self-corrects** iteratively — if MAE is too high, the LLM reasons 
    about why and tries a different approach
-5. **Returns** the best forecast, prediction intervals, and an English 
+5. **Exogenous Extraction**: Automatically translates unstructured text logs into numeric signals via an internal `LLMTextEventFeaturizer` during the fitting process.
+6. **Returns** the best forecast, prediction intervals, and an English 
    explanation of its reasoning
 
 ## Quick example
@@ -132,12 +133,26 @@ available in
 [`sktime_mcp_integration_notebook_cell.py`](./sktime_mcp_integration_notebook_cell.py)
 for easy reuse.
 
+## Standalone Text Featurization
+
+If you just need to turn text logs into exogenous data for other `sktime` models:
+
+```python
+from llm_text_featurizer import LLMTextEventFeaturizer
+
+schema = {"sentiment": "float -1.0 to 1.0"}
+featurizer = LLMTextEventFeaturizer(api_key="...", text_column="logs", feature_schema=schema)
+
+X_numeric = featurizer.fit_transform(X_text)
+```
+
 ## Project structure
 llm-pipeline-forecaster/
-├── demo_cleaned.ipynb
-├── llm_pipeline_forecaster.py
-├── sktime_mcp_tools.py
-├── sktime_mcp_integration_notebook_cell.py
+├── text_exogenous_demo.ipynb       # Main tutorial notebook
+├── demo_cleaned.ipynb              # General pipeline demo
+├── llm_pipeline_forecaster.py      # Core Agentic Forecaster
+├── llm_text_featurizer.py          # Context-Aware Transformer
+├── sktime_mcp_tools.py             # MCP Server Layer
 ├── requirements.txt
 └── README.md
 

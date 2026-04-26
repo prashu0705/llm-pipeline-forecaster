@@ -1,12 +1,21 @@
-sktime==0.40.1
-mcp
+sktime>=0.26.0
 groq
 pandas
-numpy<2
+numpy
 matplotlib
 statsmodels
 pmdarima
 scikit-learn
+mcp
 
+# Optional: LangChain support
+langchain
+langchain-core
+langchain-openai
+langchain-anthropic
+
+# Development & Testing
 pytest
 pytest-mock
+ipykernel
+nbformat

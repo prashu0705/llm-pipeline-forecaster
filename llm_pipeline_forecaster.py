@@ -8,38 +8,91 @@ import numpy as np
 import pandas as pd
 from groq import Groq
 from sktime.forecasting.base import BaseForecaster
+from sktime.registry import all_estimators
 from statsmodels.tsa.stattools import acf, adfuller
 
 
-class LLMPipelineForecaster(BaseForecaster):
-    """LLM-guided sktime forecaster with iterative pipeline selection."""
+class LLMAgentForecaster(BaseForecaster):
+    """LLM-guided sktime meta-forecaster with registry-aware selection."""
 
     _tags = {
         "scitype:y": "univariate",
         "requires-fh-in-fit": False,
-        "ignores-exogeneous-X": True,
+        "ignores-exogeneous-X": False,
         "y_inner_mtype": "pd.Series",
         "capability:pred_int": True,
     }
 
     def __init__(
         self,
-        prompt,
-        api_key,
-        model="llama-3.3-70b-versatile",
-        max_iterations=3,
-        mae_threshold=0.2,
-        date_col=None,
-        value_col=None,
+        prompt: str,
+        api_key: str = None,
+        model: str = "llama-3.3-70b-versatile",
+        backend: any = None,
+        max_iterations: int = 3,
+        mae_threshold: float = 0.2,
+        date_col: str = None,
+        value_col: str = None,
+        text_column: str = None,
+        text_schema: dict = None,
     ):
+        """
+        Initialize the LLM Agent Forecaster.
+
+        Parameters
+        ----------
+        prompt : str
+            Natural language instruction for the forecasting task.
+        api_key : str, optional
+            Groq API key. Used if backend is None.
+        model : str, optional
+            The model name to use for Groq (default: llama-3.3-70b-versatile).
+        backend : any, optional
+            A LangChain-compatible ChatModel object. If provided, api_key and model 
+            params are ignored in favor of this backend.
+        max_iterations : int, optional
+            Maximum self-correction attempts (default: 3).
+        mae_threshold : float, optional
+            Tolerance for relative MAE to stop iterating (default: 0.2).
+        date_col, value_col : str, optional
+            Column names for date and target values. Auto-detected if None.
+        text_column, text_schema : str, dict, optional
+            Parameters for text-to-exogenous featurization.
+        """
         self.prompt = prompt
         self.api_key = api_key
         self.model = model
+        self.backend = backend
         self.max_iterations = max_iterations
         self.mae_threshold = mae_threshold
         self.date_col = date_col
         self.value_col = value_col
+        self.text_column = text_column
+        self.text_schema = text_schema
         super().__init__()
+
+    def _call_llm(self, sys_prompt: str, user_prompt: str, temperature: float = 0):
+        """Internal bridge to call either Groq or LangChain backend."""
+        if self.backend:
+            # LangChain Support
+            from langchain_core.messages import SystemMessage, HumanMessage
+            response = self.backend.invoke([
+                SystemMessage(content=sys_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+            return response.content.strip()
+        else:
+            # Native Groq Support
+            client = Groq(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+            )
+            return response.choices[0].message.content.strip()
 
     def fit(self, y, X=None, fh=None):
         """Fit the forecaster from CSV, DataFrame, or Series input."""
@@ -129,6 +182,19 @@ class LLMPipelineForecaster(BaseForecaster):
         if self.intent_.get("force_model"):
             effective_iterations = 1
 
+        if self.text_column and self.text_schema:
+            print(f"Featurizing text column: {self.text_column}...")
+            from llm_text_featurizer import LLMTextEventFeaturizer
+            featurizer = LLMTextEventFeaturizer(
+                api_key=self.api_key,
+                text_column=self.text_column,
+                feature_schema=self.text_schema,
+                model=self.model
+            )
+            X = featurizer.fit_transform(X)
+            self.featurizer_ = featurizer
+            print("Text featurization complete.")
+
         self.data_summary_ = self._analyze_series(y)
 
         if self.intent_.get("ignore_seasonality"):
@@ -163,10 +229,20 @@ class LLMPipelineForecaster(BaseForecaster):
 
             print(f"LLM chose: {config}")
             print(f"Reasoning: {reasoning}")
+            
+            if "anomaly" in config:
+                 print(f"⚠️ DATA INTEGRITY ALERT: {config['anomaly']}")
 
             pipeline = None
             try:
                 pipeline = self._build_pipeline(config)
+                
+                # Validation Gate: Try a small fit on 20% of training data first
+                # This catches common parameter hallucinations or compatibility errors
+                small_slice = y_train.iloc[:max(5, len(y_train) // 5)]
+                pipeline.fit(small_slice)
+                
+                # Full validation fit
                 pipeline.fit(y_train)
                 y_pred_val = pipeline.predict(fh=val_fh)
                 y_pred_val.index = y_val.index
@@ -175,10 +251,10 @@ class LLMPipelineForecaster(BaseForecaster):
                 print(f"MAE: {mae:.2f} (relative: {mae_relative:.3f})")
             except Exception as exc:
                 failure_reason = str(exc)[:100]
-                print(f"Pipeline failed: {failure_reason}")
+                print(f"Validation Gate: Pipeline '{config.get('model')}' failed. Reason: {failure_reason}")
                 mae = float("inf")
                 mae_relative = float("inf")
-                reasoning = f"{reasoning} [FAILED: {failure_reason}]"
+                reasoning = f"{reasoning} [FAILED VALIDATION: {failure_reason}]"
 
             attempt = {
                 "iteration": i + 1,
@@ -210,8 +286,17 @@ class LLMPipelineForecaster(BaseForecaster):
                 print("All models tried. Stopping early.")
                 break
 
-        print(f"\nBest pipeline MAE: {best_mae:.2f}")
-        print("Refitting best pipeline on full data...")
+        # Baseline Comparison (The 'Needed' transparency feature)
+        print("\nCalculating Naive Baseline for comparison...")
+        from sktime.forecasting.naive import NaiveForecaster
+        naive = NaiveForecaster(strategy="last")
+        naive.fit(y_train)
+        y_pred_naive = naive.predict(fh=val_fh)
+        self.baseline_mae_ = float(np.mean(np.abs(y_val.values - y_pred_naive.values)))
+        self.best_mae_ = best_mae
+        self.lift_ = ((self.baseline_mae_ - self.best_mae_) / self.baseline_mae_) * 100
+
+        print(f"Refitting best pipeline on full data...")
         self.pipeline_ = self._build_pipeline(self.pipeline_config_)
         self.pipeline_.fit(y, fh=fh)
         return self
@@ -295,41 +380,45 @@ Rules:
 - "simple" or "baseline" -> force_model = "naive"
 - default -> accuracy_priority = "medium", others null/false
 """
-        client = Groq(api_key=self.api_key)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Prompt: {prompt}"},
-            ],
-            temperature=0,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = self._call_llm(system_prompt, f"Prompt: {prompt}", temperature=0)
         return json.loads(raw)
 
     def _ask_llm(self, data_summary, previous_attempts=None):
-        """Ask the LLM to choose a forecasting pipeline configuration."""
+        """Ask the LLM to choose a forecasting pipeline configuration.
+
+        Args:
+            data_summary (dict): Statistical summary of the time series.
+            previous_attempts (list, optional): History of failed or suboptimal attempts.
+
+        Returns:
+            tuple: (config dict, reasoning string)
+        """
         system_prompt = """You are an expert time series forecasting assistant.
 Given a statistical summary of a time series and a user prompt, choose the best sktime pipeline.
 
 Respond with ONLY a valid JSON object. No markdown. No explanation outside JSON.
 The JSON must have exactly these fields:
-{
+{{
     "detrend": true or false,
     "deseasonalize": true or false,
-    "model": one of ["naive", "arima", "ets"],
-    "reasoning": "one sentence explanation"
-}
+    "model": "exact_class_name",
+    "params": {{}},
+    "reasoning": "one sentence explanation",
+    "anomaly": null or "observation about data contradiction between text and numbers"
+}}
+
+Available sktime estimators in your environment:
+{estimators_context}
 
 Decision rules:
-- If has_trend is true, set detrend to true
-- If has_seasonality is true, set deseasonalize to true
-- If length < 50, use "naive"
-- If is_stationary is false and has_seasonality is true, use "ets"
-- If is_stationary is true, use "arima"
-- Otherwise use "arima"
+- Cross-reference text events with numerical trends. If text says 'closed' but sales are high, flag as an anomaly.
+- Prioritize models that fit the data frequency and size
+- Only choose models from the available list provided
 - If previous attempts failed, try a DIFFERENT model
 """
+        estimators = all_estimators(estimator_types="forecaster")
+        estimators_context = "\n".join([f"- {name}" for name, _ in estimators])
+        
         attempts_str = ""
         if previous_attempts:
             attempts_str = "\nPrevious attempts:\n"
@@ -354,36 +443,41 @@ Data statistics: {json.dumps(data_summary, indent=2)}
 {attempts_str}
 Respond with JSON only.
 """
-        client = Groq(api_key=self.api_key)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.2,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = self._call_llm(system_prompt.format(estimators_context=estimators_context), user_message, temperature=0.2)
+        raw = raw.replace("```json", "").replace("```", "").strip()
         config = json.loads(raw)
         reasoning = config.pop("reasoning", "No reasoning provided")
         return config, reasoning
 
     def _build_pipeline(self, config):
-        """Build an sktime forecaster pipeline from the LLM config."""
-        from sktime.forecasting.arima import AutoARIMA
+        """Dynamically build an sktime pipeline using registry-aware instantiation."""
         from sktime.forecasting.compose import TransformedTargetForecaster
-        from sktime.forecasting.exp_smoothing import ExponentialSmoothing
-        from sktime.forecasting.naive import NaiveForecaster
-        from sktime.forecasting.trend import PolynomialTrendForecaster
         from sktime.transformations.series.detrend import Detrender, Deseasonalizer
+        from sktime.forecasting.trend import PolynomialTrendForecaster
+        from sktime.registry import all_estimators
+
+        model_name = config.get("model", "NaiveForecaster")
+        params = config.get("params", {})
+        
+        # Registry-aware lookup
+        forecasters_dict = dict(all_estimators(estimator_types="forecaster"))
+        if model_name not in forecasters_dict:
+            # Fallback
+            from sktime.forecasting.naive import NaiveForecaster
+            model = NaiveForecaster()
+            print(f"Warning: {model_name} not found in registry. Falling back to NaiveForecaster.")
+        else:
+            model_cls = forecasters_dict[model_name]
+            try:
+                # Filter params to avoid init errors
+                import inspect
+                sig = inspect.signature(model_cls.__init__)
+                valid_params = {k: v for k, v in params.items() if k in sig.parameters}
+                model = model_cls(**valid_params)
+            except Exception:
+                model = model_cls()
 
         sp = self.data_summary_.get("seasonal_period", 1)
-        model_map = {
-            "naive": NaiveForecaster(strategy="last"),
-            "arima": AutoARIMA(sp=sp),
-            "ets": ExponentialSmoothing(trend="add", seasonal="add", sp=sp),
-        }
-        model = model_map.get(config.get("model", "naive"))
 
         steps = []
         if config.get("detrend"):
@@ -658,3 +752,82 @@ def plot_forecast(forecaster, y, y_pred, title=None):
     plt.savefig("forecast_plot.png", bbox_inches="tight", dpi=150)
     plt.show()
     print("Plot saved as forecast_plot.png")
+
+
+def draw_decision_flow(agent):
+    """Generate a visual decision flow of the agent's logic."""
+    if not hasattr(agent, "pipeline_config_"):
+        return "Flow not available until fit() is called."
+    
+    config = agent.pipeline_config_
+    summary = agent.data_summary_
+    
+    flow = f"""
+    [ INPUT DATA ]
+         |
+    [ STATISTICAL ANALYSIS ]
+         |--> Stationarity: {"Yes" if summary['is_stationary'] else "No"}
+         |--> Seasonality: {"Yes" if summary['has_seasonality'] else "No"}
+         |
+    [ REGISTRY DISCOVERY ]
+         |--> Scanned {len(dict(all_estimators(estimator_types="forecaster")))} estimators
+         |
+    [ LLM PLANNER SELECTION ]
+         |--> Chosen: {config['model']}
+         |--> Reasoning: {agent.reasoning_[:40]}...
+         |
+    [ VALIDATION GATE ]
+         |--> Passed 20% Data Slice Fit
+         |
+    [ FINAL RE-FIT ]
+         |
+    [ FORECAST PRODUCED ]
+    """
+    return flow
+
+
+def generate_summary_report(agent):
+    """Generate a high-impact Markdown report of the agent's work."""
+    if not hasattr(agent, "best_mae_"):
+        return "Forecaster not fitted yet."
+    
+    intent = getattr(agent, "intent_", {})
+    summary = agent.data_summary_
+    
+    report = f"""
+# 🤖 LLM Agent Forecasting Report
+
+## 🎯 Executive Summary
+- **Primary Goal**: {intent.get('intent_summary', 'Forecasting')}
+- **Accuracy Lift**: **{agent.lift_:.1f}%** (vs. Naive Baseline)
+- **Winning Model**: `{agent.pipeline_config_['model']}`
+
+## 🔍 Semantic Data Insights
+"""
+    # Look for anomalies in the log
+    anomalies = [a['config'].get('anomaly') for a in agent.iteration_log_ if a['config'].get('anomaly')]
+    if anomalies:
+        report += "### ⚠️ Data Integrity Alerts\n"
+        for a in set(anomalies):
+             report += f"- {a}\n"
+    else:
+        report += "No major semantic inconsistencies detected between text logs and numerical data.\n"
+
+    report += f"""
+## 📊 Statistical Profile
+- **Stationarity**: {"Stationary" if summary['is_stationary'] else "Non-Stationary"}
+- **Trend/Seasonality**: {"Trend " if summary['has_trend'] else ""}{"Seasonality" if summary['has_seasonality'] else ""}
+- **Data Points**: {summary['length']}
+
+## 🛠️ Iteration History
+| Iter | Model | MAE | Relative MAE | Selection Reasoning |
+| :--- | :--- | :--- | :--- | :--- |
+"""
+    for log in agent.iteration_log_:
+        report += f"| {log['iteration']} | {log['config']['model']} | {log['mae']} | {log['mae_relative']} | {log['reasoning']} |\n"
+    
+    report += f"""
+---
+*Generated by LLMAgentForecaster - sktime-native Agentic Track*
+"""
+    return report
