@@ -6,7 +6,7 @@ import os
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
-from llm_pipeline_forecaster import LLMAgentForecaster
+from llm_pipeline_forecaster import LLMPipelineForecaster
 
 mcp = FastMCP(
     name="sktime-forecasting",
